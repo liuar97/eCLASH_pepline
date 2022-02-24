@@ -1,0 +1,203 @@
+#(+) load some libraries
+library(dplyr)
+library(parallel)
+options(scipen=100)
+
+#(+) set input files
+args=commandArgs(TRUE)
+tags=strsplit(args[1], ",")[[1]]
+input_file=strsplit(args[2], ",")[[1]]
+output_file=args[3]
+
+#(+) parameters
+ncluster=24
+cutoff=8
+extend=0
+
+#(+) read the input file
+combine=Map(function(x, tag) {
+  df=read.table(x, sep="\t", header=TRUE, stringsAsFactors=FALSE)
+  df$read_name=paste0(tag, "_", df$read_name)
+  df$source=tag
+  return(df)
+}, input_files, tags) %>% do.call(rbind, .)
+combine=combine %>% subset(g_group!="U3")
+
+#(+) extend
+## for extension, it should be noticed that if the extension should not excess the boundary of snoRNAs
+
+#(+) let's start fold
+get_seq=function(chrom, region, strand){
+sorted_region=mapply(function(strand, x) if (strand=="-") rev(x) else x, strand, strsplit(region, ","), USE.NAMES=F, SIMPLIFY=F)
+l=sapply(sorted_region, length)
+input=paste(rep(chrom,l), gsub("-","\t",unlist(sorted_region), fixed=T), rep(1:length(chrom),l), 0, rep(strand, l), sep="\t")
+seq=system(paste0("bedtools getfasta -tab -name -s -fi /public/home/liuar/genome/human/hg38.fa -bed - -fo -|gawk '", 'BEGIN{FS="\t"; getline; name=$1; seq=$2} {if (name!=$1) {print seq; name=$1; seq=""} seq=seq $2} END{print seq}', "'"), input=input, intern=TRUE)
+return(seq)
+}
+
+combine$g_seq=get_seq(combine$g_chrom, combine$g_region, combine$g_strand)
+combine$t_seq=get_seq(combine$t_chrom, combine$t_region, combine$t_strand)
+
+fold=function(x) system("RNAduplex", intern=TRUE, input=x)
+cl=makeCluster(ncluster)
+ret=do.call(c, parLapply(cl, clusterSplit(cl, paste(combine$g_seq, combine$t_seq, sep="\n")), fold))
+fold_info=strcapture("^([.()]*)&([.()]*) *(\\d*),(\\d*) *: *(\\d*),(\\d*) *\\((.*)\\)$", ret, data.frame(a1=character(), a2=character(), b1=numeric(), e1=numeric(), b2=numeric(), e2=numeric(), MFE=numeric(), stringsAsFactors=F))
+stopCluster(cl)
+
+#(+) search for matches from the fold results
+get_match=function(a1, a2, b1, b2, g_seq, t_seq, cutoff){
+index1=gregexpr( "\\(",a1)[[1]]
+index2=gregexpr( "\\)",a2)[[1]]
+n_pair=length(index1)
+if (n_pair<2) return(list(as.numeric(), as.numeric(), as.numeric(), as.numeric(), as.numeric(), as.character(), as.character()))
+b_score=rep(1000, n_pair)
+base1=strsplit(toupper(g_seq), "")[[1]][b1+index1-1]
+base2=rev(strsplit(toupper(t_seq), "")[[1]][b2+index2-1])
+b_score[(base1=="T" & base2=="G") | (base1=="G" & base2=="T")]=0
+b_score[(base1=="A" & base2=="T") | (base1=="T" & base2=="A") | (base1=="G" & base2=="C") | (base1=="C" & base2=="G")]=1
+g_score=2-pmax(diff(index1), rev(diff(index2)))*2-(diff(index1)!=rev(diff(index2)))*1000
+best_score=rep(NA, n_pair)
+best_score[1]=b_score[1]
+for (i in 2:n_pair) best_score[i]=max(b_score[i], best_score[i-1]+g_score[i-1]+b_score[i])
+ends=which(best_score>=cutoff)
+starts=as.numeric()
+scores=best_score[best_score>=cutoff]
+n=length(ends)
+if (n==0) return(list(as.numeric(), as.numeric(), as.numeric(), as.numeric(), as.numeric(), as.character(), as.character()))
+for (i in 1:n) starts[i]=which(b_score[ends[i]]+rev(cumsum(rev(b_score[1:(ends[i]-1)]+g_score[1:(ends[i]-1)])))==best_score[ends[i]])[1]
+used=rep(FALSE, n_pair)
+orders=order(scores, ends-starts, decreasing=TRUE)
+keep=rep(FALSE, n)
+for (i in 1:n){
+j=orders[i]
+if (sum(used[starts[j]:ends[j]])==0) {keep[j]=TRUE; used[starts[j]:ends[j]]=TRUE}
+}
+starts=starts[keep]
+ends=ends[keep]
+scores=scores[keep]
+return(list(scores, b1+index1[starts]-1, b1+index1[ends]-1, b2+index2[n_pair-ends+1]-1, b2+index2[n_pair-starts+1]-1, substr(rep(a1, length(starts)), index1[starts], index1[ends]),substr(rep(a2, length(starts)), index2[n_pair-ends+1], index2[n_pair-starts+1])))
+}
+cl=makeCluster(ncluster)
+out=Map(list, fold_info$a1, fold_info$a2, fold_info$b1, fold_info$b2, combine$g_seq, combine$t_seq, rep(cutoff, nrow(fold_info)), USE.NAMES=FALSE)
+matches_ret=parLapply(cl, out, do.call, what=get_match)
+stopCluster(cl)
+
+#(+) generate matches table
+matches_n=sapply(matches_ret, function(x) length(x[[1]]))
+matches_df=cbind(do.call(rbind, lapply(matches_ret, as.data.frame, stringsAsFactors=F, col.names=c("V1","V2","V3","V4","V5","V6","V7"))), combine[rep(1:nrow(combine), matches_n),])
+score=matches_df$V1
+t_regions=lapply(strsplit(matches_df$t_region, ","), strsplit, "-")
+g_regions=lapply(strsplit(matches_df$g_region, ","), strsplit, "-")
+extract_region=function(region, start, end, strand){
+  region=do.call(rbind, lapply(region, as.numeric))
+  region_length=region[,2]-region[,1]
+  total_length=sum(region_length)
+  if (strand=="-") {
+    temp=total_length-end+1
+    end=total_length-start+1
+    start=temp
+  }
+  consumed=0
+  i1=NA
+  i2=NA
+  for (i in 1:nrow(region)){
+    if (is.na(i1) && consumed+region_length[i]>=start) {i1=i; chromStart=region[i, 1]+start-consumed-1}
+    if (is.na(i2) && consumed+region_length[i]>=end) {i2=i; chromEnd=region[i, 1]+end-consumed}
+    consumed=consumed+region_length[i]
+  }
+  if (i1==i2) return(paste0(chromStart,"-",chromEnd))
+  if (i2-i1==1) return(paste0(chromStart, "-", region[i1, 2],",",region[i2, 1], "-", chromEnd))
+  return (paste0(chromStart, "-", region[i1, 2],",",paste0(region[(i1+1):(i2-1),1],"-",region[(i1+1):(i2-1),2], collapse=","),",",region[i2, 1], "-", chromEnd))
+}
+t_region=mapply(extract_region, t_regions, matches_df$V4, matches_df$V5, matches_df$t_strand)
+t_start=sub("-.*", "", t_region) %>% as.numeric
+t_end=sub(".*-", "", t_region) %>% as.numeric
+g_region=mapply(extract_region, g_regions, matches_df$V2, matches_df$V3, matches_df$g_strand)
+g_start=sub("-.*", "", g_region) %>% as.numeric
+g_end=sub(".*-", "", g_region) %>% as.numeric
+t_seq=substr(matches_df$t_seq, matches_df$V4, matches_df$V5) %>% toupper
+g_seq=substr(matches_df$g_seq, matches_df$V2, matches_df$V3) %>% toupper
+
+matches=data.frame(g_gene_name=matches_df$g_gene_name, g_group=matches_df$g_group, g_chrom=matches_df$g_chrom, g_start=g_start, g_end=g_end, g_strand=matches_df$g_strand, g_region=g_region, t_gene_name=matches_df$t_gene_name, t_gene_type=matches_df$t_gene_type, t_chrom=matches_df$t_chrom, t_start=t_start, t_end=t_end,t_strand=matches_df$t_strand, t_region=t_region, score=score, g_seq=g_seq, t_seq=t_seq, g_pair=matches_df$V6, t_pair=matches_df$V7, read_name=matches_df$read_name, source=matches_df$source, chimeric_type=matches_df$chimeric_type, stringsAsFactors=F)
+
+#prepare unique matches
+index=paste(matches$g_gene_name, matches$g_start,matches$g_end, matches$t_chrom, matches$t_region, matches$t_strand, matches$g_pair, matches$t_pair,sep="$")
+umatches=matches[!duplicated(index), 1:19]
+umatches$read_name=tapply(matches$read_name, index, function(x) paste0(x, collapse=","))[unique(index)]
+umatches$count=tapply(index, index, length)[unique(index)]
+umatches$sample_count=tapply(matches$source, index, function(x) length(unique(x)))[unique(index)]
+umatches$id=paste0("INT_",1:nrow(umatches))
+
+write.table(matches, paste0(output_prefix, "matches.tsv"), quote=F, sep="\t", row.names=F)
+write.table(umatches, paste0(output_prefix, "unique_matches.tsv"), quote=F, sep="\t", row.names=F)
+
+#prepare collapsed matches
+regions=strsplit(umatches$t_region, ",")
+outbed=umatches %>% {paste(rep(paste0(.$g_group, "_", .$t_chrom), lengths(regions)), regions %>% unlist %>% sub("-", "\t", .), rep(1:nrow(.), lengths(regions)), 0, rep(.$t_strand, lengths(regions)), sep="\t")}
+ret=system("bedtools merge -s -nms -i -", input=outbed, intern=TRUE) %>% read.table(text=., sep="\t", stringsAsFactors=F)
+clusters=strsplit(ret$V4, ",") %>% lapply(as.numeric)
+match_group=rep(NA, nrow(umatches))
+groups=list()
+index=0
+for (i in 1:length(clusters)){
+if (all(is.na(match_group[clusters[[i]]]))){
+index=index+1
+match_group[clusters[[i]]]=index
+groups[[index]]=i
+} else {
+group_indices=(match_group[clusters[[i]]]) %>% {.[!is.na(.)]}
+groups[[min(group_indices)]]=c(unlist(groups[group_indices]), i)
+groups[group_indices!=min(group_indices)]=list(numeric())
+}}
+t_region=lapply(groups, function(x) {orders=order(ret$V2[x]); paste0(ret$V2[x][orders], "-", ret$V3[x][orders], collapse=",")})
+clusters=lapply(groups, function(x) unlist(clusters[x]))
+
+targets=data.frame(row.names=1:length(clusters))
+targets$guide=sapply(clusters, function(x) umatches$g_group[x[1]])
+priority=read.table("./annotation/priority.txt", stringsAsFactors=FALSE)
+priority$V1[grepl("IG_._gene", priority$V1)]="IG_gene"
+priority$V1[grepl("IG_._pseudogene", priority$V1)]="IG_pseudogene"
+priority$V1[grepl("TR_._gene", priority$V1)]="TR_gene"
+priority$V1[grepl("TR_._pseudogene", priority$V1)]="TR_pseudogene"
+priority$V1[grepl("pseudogene", priority$V1) & !grepl("(IG|TR|rRNA)_pseudogene", priority$V1)]="pseudogene"
+priority=rbind(priority, data.frame(V1=c("cds", "utr3", "utr5", "intron", "intergenic"), V2=c(795, 795, 795, -1, -1)))
+
+targets$t_gene_name=sapply(clusters, function(x) umatches$t_gene_name[x][order(priority$V2[match(umatches$t_gene_type[x], priority$V2)], decreasing=TRUE)][1])
+targets$t_gene_type=sapply(clusters, function(x) umatches$t_gene_type[x][order(priority$V2[match(umatches$t_gene_type[x], priority$V2)], decreasing=TRUE)][1])
+
+targets$t_chrom=sapply(clusters, function(x) umatches$t_chrom[x[1]])
+targets$t_start=sapply(clusters, function(x) min(umatches$t_start[x]))
+targets$t_end=sapply(clusters, function(x) max(umatches$t_end[x]))
+targets$t_strand=sapply(clusters, function(x) umatches$t_strand[x[1]])
+targets$t_region=t_region %>% unlist
+
+targets$t_region_all=sapply(clusters, function(x) paste0(umatches$t_region[x][order(umatches$score[x], decreasing=TRUE)], collapse="|"))
+targets$score_all=sapply(clusters, function(x) paste0(umatches$score[x][order(umatches$score[x], decreasing=TRUE)], collapse="|"))
+targets$seq_all=sapply(clusters, function(x) paste0(umatches$g_seq[x][order(umatches$score[x], decreasing=TRUE)], "&", umatches$t_seq[x][order(umatches$score[x], decreasing=TRUE)], collapse="|"))
+targets$pair_all=sapply(clusters, function(x) paste0(umatches$g_pair[x][order(umatches$score[x], decreasing=TRUE)], "&", umatches$t_pair[x][order(umatches$score[x], decreasing=TRUE)], collapse="|"))
+targets$read_count_all=sapply(clusters, function(x) paste0(umatches$count[x][order(umatches$score[x], decreasing=TRUE)], collapse=",")) 
+targets$read_name=sapply(clusters, function(x) strsplit(umatches$read_name[x], ",") %>% unlist %>% unique %>% paste0(collapse=","))
+targets$read_count=sapply(clusters, function(x) strsplit(umatches$read_name[x], ",") %>% unlist %>% unique %>% length)
+targets$id=sapply(clusters, function(x) umatches$id[x] %>% unlist %>% unique %>% paste0(collapse=","))
+
+write.table(targets, paste0(output_prefix, "collapse_matches.tsv"), quote=F, sep="\t", row.names=F)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

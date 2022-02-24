@@ -1,0 +1,38 @@
+#!/usr/local/bin/Rscript
+#(+) load some libraries
+library(dplyr, warn.conflicts=F)
+library(parallel)
+options(scipen=100)
+
+#(+) set input files
+args=commandArgs(TRUE)
+input_file=args[1]
+output_file=args[2]
+
+#(+) read snoRNA info
+info=read.table("./annotation/snoRNA_group.tsv", sep="\t", header=TRUE, stringsAsFactors=FALSE)
+
+#(+) select interaction pairs involving C/D box snoRNA and reform the table
+df=read.table(input_file, sep="\t", header=T, stringsAsFactors=F)
+selected=info$name[info$box=="C/D" | info$box=="both"]
+df1=df %>% subset(l_gene_name %in% selected)
+df1$chimeric_type="L"
+names(df1)=sub("^l_", "g_", names(df1))
+names(df1)=sub("^r_", "t_", names(df1))
+df2=df %>% subset(r_gene_name %in% selected)
+df2$chimeric_type="R"
+names(df2)=sub("^r_", "g_", names(df2))
+names(df2)=sub("^l_", "t_", names(df2))
+df=rbind(df1, df2[names(df1)])
+
+#(+) remove intragenic interaction pairs
+df$g_group=info$group[match(df$g_gene_name, info$name)]
+not_keep=df %>% subset(g_group==info$group[match(t_gene_name, info$name)] | (g_chrom == t_chrom & (pmin(g_end, t_end)-pmax(g_start, t_start))>=-1000)) %>% '$'(read_name) %>% unique
+df=df %>% subset(!(read_name %in% not_keep))
+
+#(+) filter interaction pairs
+df=df %>% subset(!(t_chrom=="chrM"))
+df=df %>% subset(t_gene_type!="rRNA_pseudogene" & ((t_gene_type!="rRNA" & !(t_start>=8000000 & t_end<=8500000)) | t_gene_name %in% c("RNA45SN3", "RNA28SN3", "RNA18SN3", "RNA5-8SN3", "RNA5S1")))
+df=df %>% subset(t_gene_type!="snRNA" | grepl("^RNU\\d.*\\d$", t_gene_name) | t_gene_name %in% c("U2", "U4", "U6", "RN7SK", "RNU4ATAC", "RNU6ATAC"))
+
+write.table(df[c(1, 16, 21, 18:19 ,2:15, 20)], output_file, row.names=FALSE, quote=FALSE, sep="\t")

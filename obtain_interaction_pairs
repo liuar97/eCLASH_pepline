@@ -1,0 +1,127 @@
+#!/usr/local/bin/Rscript
+#(+) load some libraries
+library(dplyr, warn.conflicts=F)
+library(parallel)
+options(scipen=100)
+ncluster=24
+
+#(+) set input files
+args=commandArgs(TRUE)
+input_file=args[1]
+output_file=args[2]
+
+#(+) some functions
+split_region=function(chromStart, cigar_values, cigar_chars){ #input the chromStart and cigars and output aligned regions in reference
+  start=as.numeric()
+  end=as.numeric()
+  reference_consumed=0
+  n=1
+  start[n]=0
+  for (i in 1:length(cigar_values)){
+    if (cigar_chars[i]=="N"){
+      end[n]=reference_consumed
+      reference_consumed=reference_consumed+cigar_values[i]
+      n=n+1
+      start[n]=reference_consumed
+    }
+    if (cigar_chars[i] %in% c("M", "D", "=", "X")) reference_consumed=reference_consumed+cigar_values[i]
+  }
+  end[n]=reference_consumed
+  ret=list(start+chromStart, end+chromStart)
+  return(ret)
+}
+get_gene_name=function(x) lapply(strsplit(x, "\\|"), function(x) if (x[1]=="intergenic") x[1] else x[2]) %>% unlist
+get_gene_type=function(x, x1, x2) {
+ret=lapply(strsplit(x, "\\|"), function(x) if (x[1]=="intergenic") x[1] else x[3]) %>% unlist
+ret[grepl("IG_._gene", ret)]="IG_gene"
+ret[grepl("IG_._pseudogene", ret)]="IG_pseudogene"
+ret[grepl("TR_._gene", ret)]="TR_gene"
+ret[grepl("TR_._pseudogene", ret)]="TR_pseudogene"
+ret[grepl("pseudogene", ret) & !grepl("(IG|TR|rRNA)_pseudogene", ret)]="pseudogene"
+ret[x1=="intron"]="intron" #paste0(ret[x1=="intron"], ":intron")
+ret[ret=="protein_coding" & grepl("cds", x2)]="cds"
+ret[ret=="protein_coding" & grepl("utr3", x2)]="utr3"
+ret[ret=="protein_coding" & grepl("utr5", x2)]="utr5"
+return(ret)
+}
+priority=as.numeric()
+priority[c("rRNA", "pre_rRNA", "Mt_rRNA", "tRNA", "Mt_tRNA", "snRNA", "snoRNA",  "scaRNA", "vaultRNA", "scRNA", "ribozyme", "misc_RNA", "sRNA", "miRNA", "cds", "utr5", "utr3", "IG_gene", "TR_gene", "rRNA_pseudogene", "pseudogene", "IG_pseudogene", "TR_pseudogene", "rRNA_blast", "lncRNA", "intron", "intergenic")]=c(21:8, 7,7,7,6,6,5,4,4,4, 3, 2, 1, 0)
+
+
+run=function(infile, outfile){
+df=read.table(infile, sep="\t", stringsAsFactors=F)
+#(+) extract position information
+process1=function(df){
+options(scipen=100)
+l_cigars=mapply(function(x, y) substr(rep(x, length(y)), y, y+attr(y, "match.length")-1), df$V12, gregexpr("[0-9]*[MIDNSHP=XB]", df$V12), USE.NAMES=F, SIMPLIFY=F)
+l_cigar_values=lapply(l_cigars, function(x) as.numeric(substr(x, 1, nchar(x)-1)))
+l_cigar_chars=lapply(l_cigars, function(x) substr(x, nchar(x), nchar(x)))
+df$l_region=mapply(split_region, df$V11-1, l_cigar_values, l_cigar_chars, SIMPLIFY=F) %>% lapply(function(x) paste0(x[[1]], "-", x[[2]], collapse=",")) %>% unlist
+df$l_chrom=df$V1
+df$l_start=df$V11-1
+df$l_end=df$V11+mapply(function(chars, values) sum((chars %in% c("M", "D", "N", "=", "X"))*values), l_cigar_chars, l_cigar_values)-1
+df$l_region_length=mapply(function(chars, values) sum((chars %in% c("M", "D", "=", "X"))*values), l_cigar_chars, l_cigar_values)
+df$l_strand=df$V3
+df$l_repeat=df$V8
+
+r_cigars=mapply(function(x, y) substr(rep(x, length(y)), y, y+attr(y, "match.length")-1), df$V14, gregexpr("[0-9]*[MIDNSHP=XB]", df$V14), USE.NAMES=F, SIMPLIFY=F)
+r_cigar_values=lapply(r_cigars, function(x) as.numeric(substr(x, 1, nchar(x)-1)))
+r_cigar_chars=lapply(r_cigars, function(x) substr(x, nchar(x), nchar(x)))
+df$r_region=mapply(split_region, df$V13-1, r_cigar_values, r_cigar_chars, SIMPLIFY=F) %>% lapply(function(x) paste0(x[[1]], "-", x[[2]], collapse=",")) %>% unlist
+df$r_chrom=df$V4
+df$r_start=df$V13-1
+df$r_end=df$V13+mapply(function(chars, values) sum((chars %in% c("M", "D", "N", "=", "X"))*values), r_cigar_chars, r_cigar_values)-1
+df$r_region_length=mapply(function(chars, values) sum((chars %in% c("M", "D", "=", "X"))*values), r_cigar_chars, r_cigar_values)
+df$r_strand=df$V6
+df$r_repeat=df$V9
+
+df$read_name=df$V10
+return(df)
+}
+
+cl=makeCluster(ncluster)
+clusterExport(cl, c("split_region", "%>%"))
+parts=df %>% {lapply(tapply(1:nrow(.), ceiling((1:nrow(.))/100000), c), function(index, df) df[index, ], .)}
+df=parLapply(cl, parts, process1) %>% do.call(rbind, .)
+
+df=df %>% subset(, c("read_name", "l_chrom", "l_start", "l_end", "l_strand", "r_chrom", "r_start", "r_end", "r_strand", "l_region", "r_region", "l_region_length", "r_region_length", "l_repeat", "r_repeat"))
+
+process2=function(df){
+options(scipen=100)
+#(+) annotate the position and select the multimap with highest priority
+l_region=strsplit(df$l_region, ",") 
+l_region_length=sapply(l_region, length)
+l_outbed=paste(rep(df$l_chrom, l_region_length), gsub("-", "\t", unlist(l_region), fixed=T), paste0(rep(df$read_name, l_region_length), ":", rep(1:nrow(df), l_region_length)), 0, rep(df$l_strand, l_region_length), sep="\t", collapse="\n")
+l_annotation=system(paste0("~/eCLASH_data_old/bedAnnotationTool/btools annotate -a /dev/stdin -b ~/eCLASH_final/annotation/gene_annotation_v38.bed -r ~/eCLASH_final/annotation/priority.txt"), input=l_outbed, intern=TRUE) %>% strsplit("\t")
+
+V1=lapply(l_annotation, function(x) x[2]) %>% unlist
+V2=lapply(l_annotation, function(x) x[3]) %>% unlist
+V3=lapply(l_annotation, function(x) x[4]) %>% unlist
+df$l_gene_name=get_gene_name(V1)
+df$l_gene_type=get_gene_type(V1, V2, V3)
+
+r_region=strsplit(df$r_region, ",") 
+r_region_length=sapply(r_region, length)
+r_outbed=paste(rep(df$r_chrom, r_region_length), gsub("-", "\t", unlist(r_region), fixed=T), paste0(rep(df$read_name, r_region_length), ":", rep(1:nrow(df), r_region_length)), 0, rep(df$r_strand, r_region_length), sep="\t", collapse="\n")
+r_annotation=system(paste0("~/eCLASH_data_old/bedAnnotationTool/btools annotate -a /dev/stdin -b ~/eCLASH_final/annotation/gene_annotation_v38.bed -r ~/eCLASH_final/annotation/priority.txt"), input=r_outbed, intern=TRUE) %>% strsplit("\t")
+
+V1=lapply(r_annotation, function(x) x[2]) %>% unlist
+V2=lapply(r_annotation, function(x) x[3]) %>% unlist
+V3=lapply(r_annotation, function(x) x[4]) %>% unlist
+df$r_gene_name=get_gene_name(V1)
+df$r_gene_type=get_gene_type(V1, V2, V3)
+return(df)
+}
+
+clusterExport(cl, c("split_region", "%>%", "get_gene_name", "get_gene_type"))
+parts=df %>% {lapply(tapply(1:nrow(.), ceiling((1:nrow(.))/100000), c), function(index, df) df[index, ], .)}
+df=parLapply(cl, parts, process2) %>% do.call(rbind, .)
+
+sum_priority=pmax(priority[df$l_gene_type], priority[df$r_gene_type])*100+pmin(priority[df$l_gene_type], priority[df$r_gene_type])
+df=df %>% subset(tapply(sum_priority, read_name, max)[read_name]==sum_priority)
+
+write.table(df, outfile, row.names=FALSE, quote=FALSE, sep="\t")
+cat(input_file," finished!\n")
+}
+run(input_file, output_file)
+
