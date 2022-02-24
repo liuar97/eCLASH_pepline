@@ -1,3 +1,4 @@
+#!/usr/local/bin/Rscript
 #(+) load some libraries
 library(dplyr)
 library(parallel)
